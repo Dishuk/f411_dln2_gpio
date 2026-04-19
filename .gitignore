@@ -1,0 +1,46 @@
+# --- Build output ---
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+
+# --- CubeMX-generated (re-created on .ioc regen) ---
+# HAL and CMSIS drivers
+Drivers/
+# USB Device / other middlewares
+Middlewares/
+# Linker scripts
+STM32F411CEUX_FLASH.ld
+STM32F411CEUX_RAM.ld
+# Startup assembly
+Core/Startup/
+# CubeMX boilerplate without USER CODE regions (pure regen output)
+Core/Src/sysmem.c
+Core/Src/syscalls.c
+Core/Src/system_stm32f4xx.c
+# CubeMX internal tracking
+.mxproject
+
+# --- Eclipse / STM32CubeIDE ---
+.metadata/
+.settings/
+*.launch
+*.swp
+
+# --- Stale toolchain folders (if CubeMX is ever pointed elsewhere) ---
+EWARM/
+MDK-ARM/
+
+# --- Local-only notes, fetched reference material, Claude memory ---
+.local/
+
+# --- OS noise ---
+Thumbs.db
+.DS_Store
