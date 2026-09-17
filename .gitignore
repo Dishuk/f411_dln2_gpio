@@ -11,6 +11,14 @@ Release/
 *.su
 *.cyclo
 
+# --- Linux kernel module build (host/) ---
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+
 # --- CubeMX-generated (re-created on .ioc regen) ---
 # HAL and CMSIS drivers
 Drivers/
