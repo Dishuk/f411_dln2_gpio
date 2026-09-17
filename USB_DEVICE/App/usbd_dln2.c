@@ -123,6 +123,22 @@ static volatile uint8_t USBD_DLN2_Reconfigured;
 #define DLN2_HANDLE_CTRL        0x0001U
 #define DLN2_HANDLE_GPIO        0x0002U
 #define DLN2_HANDLE_SPI         0x0004U
+#define DLN2_HANDLE_ADC         0x0005U
+
+/* ADC commands, module = 0x06 (handle 5). Only the ones
+ * drivers/iio/adc/dln2-adc.c sends. */
+#define DLN2_ADC_GET_CHANNEL_COUNT   0x0601U
+#define DLN2_ADC_ENABLE              0x0602U
+#define DLN2_ADC_DISABLE             0x0603U
+#define DLN2_ADC_CHANNEL_ENABLE      0x0605U
+#define DLN2_ADC_CHANNEL_DISABLE     0x0606U
+#define DLN2_ADC_SET_RESOLUTION      0x0608U
+#define DLN2_ADC_CHANNEL_GET_VAL     0x060AU
+#define DLN2_ADC_CHANNEL_GET_ALL_VAL 0x060BU
+#define DLN2_ADC_CHANNEL_SET_CFG     0x060CU
+#define DLN2_ADC_CONDITION_MET_EV    0x0610U
+#define DLN2_ADC_EVENT_NONE          0U
+#define DLN2_ADC_EVENT_ALWAYS        5U
 
 #define DLN2_CMD_GET_DEVICE_VER 0x0030U
 #define DLN2_CMD_GET_DEVICE_SN  0x0031U
@@ -697,6 +713,166 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
   }
 }
 
+/* ADC1, 10-bit. Channels 0-3 = PA0-PA3, 4 = VREFINT, 5 = temperature
+ * sensor. The ADC stays powered: the host enables/disables it around every
+ * single read, and waking it each time would cost its startup delay. */
+#define ADC_N_CH      6U
+static const uint8_t adc_hw_ch[ADC_N_CH] = {0, 1, 2, 3, 17, 18};
+static uint8_t  adc_ch_enabled;             /* bitmask, from CHANNEL_ENABLE */
+static uint16_t adc_period[ADC_N_CH];       /* ms; 0 = no periodic event */
+static uint32_t adc_next[ADC_N_CH];         /* HAL_GetTick() deadline */
+static uint8_t  adc_due;                    /* bitmask of events to send */
+static uint16_t adc_evt_count;
+static uint8_t  USBD_DLN2_AdcEvtBuffer[15];
+
+static void adc_init(void)
+{
+  __HAL_RCC_ADC1_CLK_ENABLE();
+
+  GPIO_InitTypeDef init = {
+    .Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3,
+    .Mode = GPIO_MODE_ANALOG,
+    .Pull = GPIO_NOPULL,
+  };
+  HAL_GPIO_Init(GPIOA, &init);
+
+  /* 96 MHz / 6 = 16 MHz ADC clock (max 18). VREFINT + temp sensor on. */
+  ADC->CCR = ADC_CCR_ADCPRE_1 | ADC_CCR_TSVREFE;
+  ADC1->CR1 = ADC_CR1_RES_0;                 /* 10-bit */
+  /* 480-cycle sampling (~30 µs per conversion) on every channel: the
+   * internal ones need >= 10 µs, and it suits high-impedance sources. */
+  ADC1->SMPR1 = 0x07FFFFFFU;
+  ADC1->SMPR2 = 0x3FFFFFFFU;
+  ADC1->CR2 = ADC_CR2_ADON;
+}
+
+static uint16_t adc_convert(uint8_t ch)
+{
+  ADC1->SQR3 = adc_hw_ch[ch];
+  ADC1->SR = 0U;
+  ADC1->CR2 |= ADC_CR2_SWSTART;
+  while ((ADC1->SR & ADC_SR_EOC) == 0U) {}
+  return (uint16_t)ADC1->DR;
+}
+
+/* Marks channels whose period has elapsed. Deadlines advance by whole
+ * periods; a host that falls far behind gets one event, not a burst. */
+static void adc_scan(void)
+{
+  uint32_t now = HAL_GetTick();
+  for (uint8_t ch = 0U; ch < ADC_N_CH; ch++) {
+    if (adc_period[ch] != 0U && now - adc_next[ch] < 0x80000000UL) {
+      adc_due |= (uint8_t)(1U << ch);
+      adc_next[ch] += adc_period[ch];
+      if (now - adc_next[ch] < 0x80000000UL) {
+        adc_next[ch] = now + adc_period[ch];
+      }
+    }
+  }
+}
+
+static void adc_evt_send(USBD_HandleTypeDef *pdev)
+{
+  uint8_t ch = (uint8_t)__builtin_ctz(adc_due);
+  uint8_t *b = USBD_DLN2_AdcEvtBuffer;
+  adc_due &= (uint8_t)~(1U << ch);
+  /* Header without a result field, then count, port, channel, value,
+   * type. The kernel only uses the event as a trigger. */
+  put_le16(&b[0], sizeof(USBD_DLN2_AdcEvtBuffer));
+  put_le16(&b[2], DLN2_ADC_CONDITION_MET_EV);
+  put_le16(&b[4], 0U);
+  put_le16(&b[6], DLN2_HANDLE_EVENT);
+  put_le16(&b[8], ++adc_evt_count);
+  b[10] = 0U;
+  b[11] = ch;
+  put_le16(&b[12], adc_convert(ch));
+  b[14] = DLN2_ADC_EVENT_ALWAYS;
+  dln2_transmit(pdev, TX_EVENT, b, sizeof(USBD_DLN2_AdcEvtBuffer));
+}
+
+static void handle_adc(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
+{
+  /* Requests: port (only 0), then channel for per-channel commands. */
+  const uint8_t *req = &USBD_DLN2_RxBuffer[8];
+  uint8_t ch = (len >= 10U) ? req[1] : 0xFFU;
+
+  switch (id) {
+  case DLN2_ADC_SET_RESOLUTION:            /* port, bits; the kernel sends 10 */
+    dln2_reply(pdev, 10U, (ch == 10U) ? DLN2_RESULT_OK : DLN2_RESULT_UNSUPPORTED);
+    return;
+
+  case DLN2_ADC_GET_CHANNEL_COUNT:
+    USBD_DLN2_TxBuffer[10] = ADC_N_CH;
+    dln2_reply(pdev, 11U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_ADC_ENABLE:                    /* reply: pin conflict mask, none */
+  case DLN2_ADC_DISABLE:
+    put_le16(&USBD_DLN2_TxBuffer[10], 0U);
+    dln2_reply(pdev, 12U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_ADC_CHANNEL_GET_ALL_VAL: {
+    /* Reply: enabled mask, then 8 values (unused/disabled ones 0). */
+    put_le16(&USBD_DLN2_TxBuffer[10], adc_ch_enabled);
+    for (uint8_t i = 0U; i < 8U; i++) {
+      uint16_t v = (i < ADC_N_CH && (adc_ch_enabled & (1U << i))) ? adc_convert(i) : 0U;
+      put_le16(&USBD_DLN2_TxBuffer[12U + 2U * i], v);
+    }
+    dln2_reply(pdev, 28U, DLN2_RESULT_OK);
+    return;
+  }
+
+  default:
+    break;
+  }
+
+  if (ch >= ADC_N_CH) {
+    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+    return;
+  }
+
+  switch (id) {
+  case DLN2_ADC_CHANNEL_ENABLE:
+    adc_ch_enabled |= (uint8_t)(1U << ch);
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_ADC_CHANNEL_DISABLE:
+    adc_ch_enabled &= (uint8_t)~(1U << ch);
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_ADC_CHANNEL_GET_VAL:
+    put_le16(&USBD_DLN2_TxBuffer[10], adc_convert(ch));
+    dln2_reply(pdev, 12U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_ADC_CHANNEL_SET_CFG: {
+    /* port, channel, type, period (le16, ms), low, high. The kernel only
+     * uses "always" (periodic) and "none"; threshold types aren't done. */
+    uint8_t type = (len >= 13U) ? req[2] : 0xFFU;
+    uint16_t period = (len >= 13U) ? get_le16(&req[3]) : 0U;
+    if (type == DLN2_ADC_EVENT_NONE || (type == DLN2_ADC_EVENT_ALWAYS && period == 0U)) {
+      adc_period[ch] = 0U;
+      adc_due &= (uint8_t)~(1U << ch);
+    } else if (type == DLN2_ADC_EVENT_ALWAYS) {
+      adc_period[ch] = period;
+      adc_next[ch] = HAL_GetTick() + period;
+    } else {
+      dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+      return;
+    }
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+  }
+
+  default:
+    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+    return;
+  }
+}
+
 static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
   UNUSED(cfgidx);
@@ -709,6 +885,7 @@ static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   if (!hw_ready) {
     gpio_init_all();
     spi_init();
+    adc_init();
     hw_ready = 1U;
   }
 
@@ -826,17 +1003,26 @@ void USBD_DLN2_Poll(void)
     evt_enabled = 0U;
     evt_debounce = 0U;
     evt_head = evt_tail = 0U;
+    adc_ch_enabled = 0U;
+    adc_due = 0U;
+    memset(adc_period, 0, sizeof(adc_period));
   }
 
   evt_scan();
+  adc_scan();
 
   if (USBD_DLN2_TxKind != TX_IDLE) {
     return;
   }
   /* Requests first: the host often answers an event with a request. */
   if (!USBD_DLN2_RxReady) {
-    if (evt_head != evt_tail && USBD_DLN2_Dev->dev_state == USBD_STATE_CONFIGURED) {
+    if (USBD_DLN2_Dev->dev_state != USBD_STATE_CONFIGURED) {
+      return;
+    }
+    if (evt_head != evt_tail) {
       evt_send(USBD_DLN2_Dev);
+    } else if (adc_due != 0U) {
+      adc_evt_send(USBD_DLN2_Dev);
     }
     return;
   }
@@ -856,6 +1042,8 @@ void USBD_DLN2_Poll(void)
     handle_gpio(pdev, id, size);
   } else if (handle == DLN2_HANDLE_SPI) {
     handle_spi(pdev, id, size);
+  } else if (handle == DLN2_HANDLE_ADC) {
+    handle_adc(pdev, id, size);
   } else {
     dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
   }
