@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Registers an ADXL345 on CS0 of the first dln2-spi controller and binds it
- * to spidev, so it shows up as /dev/spidevN.0.
+ * Registers an ADXL345 on a chip select (default CS0) of the first dln2-spi
+ * controller and binds it to spidev, so it shows up as /dev/spidevN.<cs>.
  *
  * A USB adapter has no firmware tables describing what is wired to it, and
  * spi has no sysfs "new_device", hence this module.
@@ -14,6 +14,10 @@
 static uint speed_hz = 1000000;
 module_param(speed_hz, uint, 0444);
 MODULE_PARM_DESC(speed_hz, "Max SPI clock rate (ADXL345 allows up to 5 MHz)");
+
+static uint cs;
+module_param(cs, uint, 0444);
+MODULE_PARM_DESC(cs, "Chip select (0..3, firmware pins PA4/PA8/PA9/PA10)");
 
 static struct spi_device *adxl;
 
@@ -52,7 +56,7 @@ static int __init dln2_adxl345_init(void)
 	 * zeroed slots as duplicates of CS0 (as spi_new_device() does). */
 	for (i = 0; i < SPI_CS_CNT_MAX; i++)
 		spi_set_chipselect(adxl, i, 0xFF);
-	spi_set_chipselect(adxl, 0, 0);
+	spi_set_chipselect(adxl, 0, cs);
 	adxl->cs_index_mask = BIT(0);
 	strscpy(adxl->modalias, "adxl345", sizeof(adxl->modalias));
 

@@ -159,6 +159,7 @@ static volatile uint8_t USBD_DLN2_Reconfigured;
 #define DLN2_SPI_WRITE                     0x021CU
 #define DLN2_SPI_SET_SS                    0x0226U
 #define DLN2_SPI_SS_MULTI_ENABLE           0x0238U
+#define DLN2_SPI_SS_MULTI_DISABLE          0x0239U
 #define DLN2_SPI_GET_SUPPORTED_FRAME_SIZES 0x0243U
 #define DLN2_SPI_GET_SS_COUNT              0x0244U
 #define DLN2_SPI_GET_MIN_FREQUENCY         0x0245U
@@ -450,10 +451,13 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
   }
 }
 
-/* SPI1 master: SCK=PA5, MISO=PA6, MOSI=PA7, single chip select CS0=PA4
- * driven by hand. Polled, 8-bit frames only. */
-#define SPI_CS_PORT   GPIOA
-#define SPI_CS_PIN    GPIO_PIN_4
+/* SPI1 master: SCK=PA5, MISO=PA6, MOSI=PA7. Chip selects CS0..CS3 =
+ * PA4, PA8, PA9, PA10, driven by hand. Polled, 8- or 16-bit frames. */
+#define SPI_N_CS      4U
+static const uint8_t spi_cs_bit[SPI_N_CS] = {4, 8, 9, 10};   /* on GPIOA */
+static uint16_t spi_cs_all;       /* GPIOA pin mask of all CS lines */
+static uint8_t  spi_cs_selected = 0x01U;   /* CS indices, from SET_SS */
+static uint8_t  spi_cs_enabled;            /* CS indices, from SS_MULTI_* */
 
 static uint32_t spi_cr1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI |
                           (7U << SPI_CR1_BR_Pos);   /* mode 0, slowest */
@@ -472,13 +476,29 @@ static void spi_init(void)
   };
   HAL_GPIO_Init(GPIOA, &init);
 
-  HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
-  init.Pin = SPI_CS_PIN;
+  for (uint8_t i = 0U; i < SPI_N_CS; i++) {
+    spi_cs_all |= (uint16_t)(1U << spi_cs_bit[i]);
+  }
+  GPIOA->BSRR = spi_cs_all;       /* deselected (high) before driving */
+  init.Pin = spi_cs_all;
   init.Mode = GPIO_MODE_OUTPUT_PP;
   init.Alternate = 0U;
-  HAL_GPIO_Init(SPI_CS_PORT, &init);
+  HAL_GPIO_Init(GPIOA, &init);
 
   SPI1->CR1 = spi_cr1;
+}
+
+/* GPIOA pin mask of the lines a transfer should pull low. */
+static uint16_t spi_cs_active(void)
+{
+  uint16_t pins = 0U;
+  uint8_t cs = spi_cs_selected & spi_cs_enabled;
+  for (uint8_t i = 0U; i < SPI_N_CS; i++) {
+    if (cs & (1U << i)) {
+      pins |= (uint16_t)(1U << spi_cs_bit[i]);
+    }
+  }
+  return pins;
 }
 
 /* CR1 settings may only change while SPE is clear; the host disables the
@@ -489,22 +509,32 @@ static void spi_set_cr1(uint32_t mask, uint32_t value)
   SPI1->CR1 = (SPI1->CR1 & SPI_CR1_SPE) | spi_cr1;
 }
 
-/* Clocks out len bytes from tx (0x00 if NULL), storing MISO in rx if set. */
+/* Clocks out len bytes from tx (0x00 if NULL), storing MISO in rx if set.
+ * In 16-bit mode each frame is two little-endian bytes; len is even. */
 static void spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len, uint8_t attr)
 {
-  HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_RESET);
-  for (uint16_t i = 0U; i < len; i++) {
+  uint16_t step = (spi_cr1 & SPI_CR1_DFF) ? 2U : 1U;
+
+  GPIOA->BSRR = (uint32_t)spi_cs_active() << 16;   /* active low */
+  for (uint16_t i = 0U; i < len; i += step) {
+    uint16_t w = 0U;
+    if (tx) {
+      w = (step == 2U) ? get_le16(&tx[i]) : tx[i];
+    }
     while ((SPI1->SR & SPI_SR_TXE) == 0U) {}
-    SPI1->DR = tx ? tx[i] : 0x00U;
+    SPI1->DR = w;
     while ((SPI1->SR & SPI_SR_RXNE) == 0U) {}
-    uint8_t b = (uint8_t)SPI1->DR;
+    w = (uint16_t)SPI1->DR;
     if (rx) {
-      rx[i] = b;
+      rx[i] = (uint8_t)w;
+      if (step == 2U) {
+        rx[i + 1U] = (uint8_t)(w >> 8);
+      }
     }
   }
   while ((SPI1->SR & SPI_SR_BSY) != 0U) {}
   if ((attr & DLN2_SPI_ATTR_LEAVE_SS_LOW) == 0U) {
-    HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
+    GPIOA->BSRR = spi_cs_all;
   }
 }
 
@@ -526,8 +556,18 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
     dln2_reply(pdev, 10U, DLN2_RESULT_OK);
     return;
 
-  case DLN2_SPI_SET_SS:            /* one CS line, asserted by every transfer */
+  case DLN2_SPI_SET_SS:            /* a 0 bit selects that CS line */
+    spi_cs_selected = (uint8_t)~req[0] & ((1U << SPI_N_CS) - 1U);
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
   case DLN2_SPI_SS_MULTI_ENABLE:
+  case DLN2_SPI_SS_MULTI_DISABLE:
+    if (id == DLN2_SPI_SS_MULTI_ENABLE) {
+      spi_cs_enabled |= req[0] & ((1U << SPI_N_CS) - 1U);
+    } else {
+      spi_cs_enabled &= (uint8_t)~req[0];
+    }
     dln2_reply(pdev, 10U, DLN2_RESULT_OK);
     return;
 
@@ -537,7 +577,12 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
     return;
 
   case DLN2_SPI_SET_FRAME_SIZE:
-    dln2_reply(pdev, 10U, (req[0] == 8U) ? DLN2_RESULT_OK : DLN2_RESULT_UNSUPPORTED);
+    if (req[0] != 8U && req[0] != 16U) {
+      dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+      return;
+    }
+    spi_set_cr1(SPI_CR1_DFF, (req[0] == 16U) ? SPI_CR1_DFF : 0U);
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
     return;
 
   case DLN2_SPI_SET_FREQUENCY: {
@@ -556,7 +601,7 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
   }
 
   case DLN2_SPI_GET_SS_COUNT:
-    put_le16(&USBD_DLN2_TxBuffer[10], 1U);
+    put_le16(&USBD_DLN2_TxBuffer[10], SPI_N_CS);
     dln2_reply(pdev, 12U, DLN2_RESULT_OK);
     return;
 
@@ -570,8 +615,9 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
   case DLN2_SPI_GET_SUPPORTED_FRAME_SIZES:
     /* The host requires the full 1 + 36 byte table. */
     memset(&USBD_DLN2_TxBuffer[10], 0, 37U);
-    USBD_DLN2_TxBuffer[10] = 1U;
+    USBD_DLN2_TxBuffer[10] = 2U;
     USBD_DLN2_TxBuffer[11] = 8U;
+    USBD_DLN2_TxBuffer[12] = 16U;
     dln2_reply(pdev, 47U, DLN2_RESULT_OK);
     return;
 
@@ -584,7 +630,8 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
     const uint8_t *data = (id == DLN2_SPI_READ) ? NULL : &req[3];
     /* With SPE clear the busy-waits in spi_xfer() would never finish. */
     if ((SPI1->CR1 & SPI_CR1_SPE) == 0U ||
-        size > DLN2_SPI_MAX_XFER_SIZE || (data && len < 12U + size)) {
+        size > DLN2_SPI_MAX_XFER_SIZE || (data && len < 12U + size) ||
+        ((spi_cr1 & SPI_CR1_DFF) && (size & 1U))) {
       dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
       return;
     }
