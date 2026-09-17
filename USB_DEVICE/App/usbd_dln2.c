@@ -1,7 +1,8 @@
 /**
  * @file    usbd_dln2.c
  * @brief   Vendor-specific bulk USB class emulating the Diolan DLN-2:
- *          CTRL handshake + GPIO commands on handle=0x0002.
+ *          CTRL handshake, GPIO commands on handle=0x0002 and SPI master
+ *          commands on handle=0x0004.
  *          Unknown commands reply result=0x81 to fail fast on the host.
  */
 
@@ -90,11 +91,21 @@ __ALIGN_BEGIN static uint8_t USBD_DLN2_DeviceQualifierDesc[USB_LEN_DEV_QUALIFIER
   0x00,
 };
 
-static uint8_t USBD_DLN2_RxBuffer[DLN2_MAX_PACKET_SIZE];
-static uint8_t USBD_DLN2_TxBuffer[16];
+/* Largest message either way: 8-byte header + SPI port/size/attr (4) +
+ * 256 data bytes on requests, 10-byte header + size (2) + 256 on replies. */
+#define DLN2_MSG_MAX            272U
+
+/* A request can span several 64-byte packets and the host sends no ZLP,
+ * so packets are appended here until the header's size field is reached.
+ * One extra packet of headroom because each receive is armed for 64 bytes. */
+static uint8_t  USBD_DLN2_RxBuffer[DLN2_MSG_MAX + DLN2_MAX_PACKET_SIZE];
+static uint16_t USBD_DLN2_RxLen;
+static uint8_t  USBD_DLN2_TxBuffer[DLN2_MSG_MAX];
+static uint16_t USBD_DLN2_TxLen;
 
 #define DLN2_HANDLE_CTRL        0x0001U
 #define DLN2_HANDLE_GPIO        0x0002U
+#define DLN2_HANDLE_SPI         0x0004U
 
 #define DLN2_CMD_GET_DEVICE_VER 0x0030U
 #define DLN2_CMD_GET_DEVICE_SN  0x0031U
@@ -111,6 +122,25 @@ static uint8_t USBD_DLN2_TxBuffer[16];
 #define DLN2_GPIO_PIN_SET_DIR     0x0113U
 #define DLN2_GPIO_PIN_GET_DIR     0x0114U
 #define DLN2_GPIO_PIN_SET_EVENT   0x011EU
+
+/* SPI commands, module = 0x02. Only the ones drivers/spi/spi-dln2.c sends. */
+#define DLN2_SPI_ENABLE                    0x0211U
+#define DLN2_SPI_DISABLE                   0x0212U
+#define DLN2_SPI_SET_MODE                  0x0214U
+#define DLN2_SPI_SET_FRAME_SIZE            0x0216U
+#define DLN2_SPI_SET_FREQUENCY             0x0218U
+#define DLN2_SPI_READ_WRITE                0x021AU
+#define DLN2_SPI_READ                      0x021BU
+#define DLN2_SPI_WRITE                     0x021CU
+#define DLN2_SPI_SET_SS                    0x0226U
+#define DLN2_SPI_SS_MULTI_ENABLE           0x0238U
+#define DLN2_SPI_GET_SUPPORTED_FRAME_SIZES 0x0243U
+#define DLN2_SPI_GET_SS_COUNT              0x0244U
+#define DLN2_SPI_GET_MIN_FREQUENCY         0x0245U
+#define DLN2_SPI_GET_MAX_FREQUENCY         0x0246U
+
+#define DLN2_SPI_MAX_XFER_SIZE    256U
+#define DLN2_SPI_ATTR_LEAVE_SS_LOW 0x01U
 
 #define DLN2_RESULT_OK            0x0000U
 #define DLN2_RESULT_UNSUPPORTED   0x0081U   /* any value > 0x80 fails on host */
@@ -140,14 +170,33 @@ static const struct {
   {GPIOB, 15},  /* pin 16 */
 };
 
+static uint16_t get_le16(const uint8_t *p)
+{
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static void put_le16(uint8_t *p, uint16_t v)
+{
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  p[2] = (uint8_t)(v >> 16);
+  p[3] = (uint8_t)(v >> 24);
+}
+
+/* Payload (if any) must already be at TxBuffer[10]. */
 static void dln2_reply(USBD_HandleTypeDef *pdev, uint16_t total_size, uint16_t result)
 {
-  USBD_DLN2_TxBuffer[0] = (uint8_t)total_size;
-  USBD_DLN2_TxBuffer[1] = (uint8_t)(total_size >> 8);
+  put_le16(&USBD_DLN2_TxBuffer[0], total_size);
   /* Copy id, echo, handle from the request. */
   memcpy(&USBD_DLN2_TxBuffer[2], &USBD_DLN2_RxBuffer[2], 6);
-  USBD_DLN2_TxBuffer[8] = (uint8_t)result;
-  USBD_DLN2_TxBuffer[9] = (uint8_t)(result >> 8);
+  put_le16(&USBD_DLN2_TxBuffer[8], result);
+  USBD_DLN2_TxLen = total_size;
   USBD_LL_Transmit(pdev, DLN2_IN_EP, USBD_DLN2_TxBuffer, total_size);
 }
 
@@ -181,10 +230,7 @@ static void handle_ctrl(USBD_HandleTypeDef *pdev, uint16_t id)
     dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
     return;
   }
-  USBD_DLN2_TxBuffer[10] = (uint8_t)payload;
-  USBD_DLN2_TxBuffer[11] = (uint8_t)(payload >> 8);
-  USBD_DLN2_TxBuffer[12] = (uint8_t)(payload >> 16);
-  USBD_DLN2_TxBuffer[13] = (uint8_t)(payload >> 24);
+  put_le32(&USBD_DLN2_TxBuffer[10], payload);
   dln2_reply(pdev, 14U, DLN2_RESULT_OK);
 }
 
@@ -193,14 +239,12 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
   /* Requests that take a pin argument have it at offset 8 (after header). */
   uint16_t pin = 0U;
   if (len >= 10U) {
-    pin = (uint16_t)USBD_DLN2_RxBuffer[8] |
-          ((uint16_t)USBD_DLN2_RxBuffer[9] << 8);
+    pin = get_le16(&USBD_DLN2_RxBuffer[8]);
   }
 
   switch (id) {
   case DLN2_GPIO_GET_PIN_COUNT:
-    USBD_DLN2_TxBuffer[10] = (uint8_t)DLN2_N_PINS;
-    USBD_DLN2_TxBuffer[11] = 0U;
+    put_le16(&USBD_DLN2_TxBuffer[10], DLN2_N_PINS);
     dln2_reply(pdev, 12U, DLN2_RESULT_OK);
     return;
 
@@ -235,8 +279,7 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
 
   case DLN2_GPIO_PIN_GET_DIR:
     if (pin >= DLN2_N_PINS) { dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED); return; }
-    USBD_DLN2_TxBuffer[10] = (uint8_t)pin;
-    USBD_DLN2_TxBuffer[11] = (uint8_t)(pin >> 8);
+    put_le16(&USBD_DLN2_TxBuffer[10], pin);
     USBD_DLN2_TxBuffer[12] = gpio_is_output(pin);
     dln2_reply(pdev, 13U, DLN2_RESULT_OK);
     return;
@@ -247,8 +290,7 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
     uint32_t reg = (id == DLN2_GPIO_PIN_GET_VAL)
                    ? dln2_pin_map[pin].port->IDR
                    : dln2_pin_map[pin].port->ODR;
-    USBD_DLN2_TxBuffer[10] = (uint8_t)pin;
-    USBD_DLN2_TxBuffer[11] = (uint8_t)(pin >> 8);
+    put_le16(&USBD_DLN2_TxBuffer[10], pin);
     USBD_DLN2_TxBuffer[12] = (uint8_t)((reg >> dln2_pin_map[pin].bit) & 1U);
     dln2_reply(pdev, 13U, DLN2_RESULT_OK);
     return;
@@ -269,12 +311,167 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
   }
 }
 
+/* SPI1 master: SCK=PA5, MISO=PA6, MOSI=PA7, single chip select CS0=PA4
+ * driven by hand. Polled, 8-bit frames only. */
+#define SPI_CS_PORT   GPIOA
+#define SPI_CS_PIN    GPIO_PIN_4
+
+static uint32_t spi_cr1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI |
+                          (7U << SPI_CR1_BR_Pos);   /* mode 0, slowest */
+
+static void spi_init(void)
+{
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_SPI1_CLK_ENABLE();
+
+  GPIO_InitTypeDef init = {
+    .Pin = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7,
+    .Mode = GPIO_MODE_AF_PP,
+    .Pull = GPIO_NOPULL,
+    .Speed = GPIO_SPEED_FREQ_VERY_HIGH,
+    .Alternate = GPIO_AF5_SPI1,
+  };
+  HAL_GPIO_Init(GPIOA, &init);
+
+  HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
+  init.Pin = SPI_CS_PIN;
+  init.Mode = GPIO_MODE_OUTPUT_PP;
+  init.Alternate = 0U;
+  HAL_GPIO_Init(SPI_CS_PORT, &init);
+
+  SPI1->CR1 = spi_cr1;
+}
+
+/* CR1 settings may only change while SPE is clear; the host disables the
+ * module before any SET_* command, so just keep SPE as it is. */
+static void spi_set_cr1(uint32_t mask, uint32_t value)
+{
+  spi_cr1 = (spi_cr1 & ~mask) | value;
+  SPI1->CR1 = (SPI1->CR1 & SPI_CR1_SPE) | spi_cr1;
+}
+
+/* Clocks out len bytes from tx (0x00 if NULL), storing MISO in rx if set. */
+static void spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len, uint8_t attr)
+{
+  HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_RESET);
+  for (uint16_t i = 0U; i < len; i++) {
+    while ((SPI1->SR & SPI_SR_TXE) == 0U) {}
+    SPI1->DR = tx ? tx[i] : 0x00U;
+    while ((SPI1->SR & SPI_SR_RXNE) == 0U) {}
+    uint8_t b = (uint8_t)SPI1->DR;
+    if (rx) {
+      rx[i] = b;
+    }
+  }
+  while ((SPI1->SR & SPI_SR_BSY) != 0U) {}
+  if ((attr & DLN2_SPI_ATTR_LEAVE_SS_LOW) == 0U) {
+    HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
+  }
+}
+
+static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
+{
+  /* Every request starts with a port byte at offset 8; there is only port 0. */
+  const uint8_t *req = &USBD_DLN2_RxBuffer[9];
+  uint32_t pclk = HAL_RCC_GetPCLK2Freq();
+
+  switch (id) {
+  case DLN2_SPI_ENABLE:
+    SPI1->CR1 = spi_cr1 | SPI_CR1_SPE;
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_DISABLE:
+    while ((SPI1->SR & SPI_SR_BSY) != 0U) {}
+    SPI1->CR1 = spi_cr1;
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_SET_SS:            /* one CS line, asserted by every transfer */
+  case DLN2_SPI_SS_MULTI_ENABLE:
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_SET_MODE:          /* bit0 = CPHA, bit1 = CPOL, same as CR1 */
+    spi_set_cr1(SPI_CR1_CPHA | SPI_CR1_CPOL, req[0] & 0x3U);
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_SET_FRAME_SIZE:
+    dln2_reply(pdev, 10U, (req[0] == 8U) ? DLN2_RESULT_OK : DLN2_RESULT_UNSUPPORTED);
+    return;
+
+  case DLN2_SPI_SET_FREQUENCY: {
+    /* Round down: pick the smallest divider whose rate does not exceed the
+     * request, or the largest divider (/256) if even that is too fast. */
+    uint32_t want = (uint32_t)req[0] | ((uint32_t)req[1] << 8) |
+                    ((uint32_t)req[2] << 16) | ((uint32_t)req[3] << 24);
+    uint32_t br = 0U;
+    while (br < 7U && (pclk >> (br + 1U)) > want) {
+      br++;
+    }
+    spi_set_cr1(SPI_CR1_BR, br << SPI_CR1_BR_Pos);
+    put_le32(&USBD_DLN2_TxBuffer[10], pclk >> (br + 1U));
+    dln2_reply(pdev, 14U, DLN2_RESULT_OK);
+    return;
+  }
+
+  case DLN2_SPI_GET_SS_COUNT:
+    put_le16(&USBD_DLN2_TxBuffer[10], 1U);
+    dln2_reply(pdev, 12U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_GET_MIN_FREQUENCY:
+  case DLN2_SPI_GET_MAX_FREQUENCY:
+    put_le32(&USBD_DLN2_TxBuffer[10],
+             (id == DLN2_SPI_GET_MIN_FREQUENCY) ? (pclk / 256U) : (pclk / 2U));
+    dln2_reply(pdev, 14U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_GET_SUPPORTED_FRAME_SIZES:
+    /* The host requires the full 1 + 36 byte table. */
+    memset(&USBD_DLN2_TxBuffer[10], 0, 37U);
+    USBD_DLN2_TxBuffer[10] = 1U;
+    USBD_DLN2_TxBuffer[11] = 8U;
+    dln2_reply(pdev, 47U, DLN2_RESULT_OK);
+    return;
+
+  case DLN2_SPI_READ_WRITE:
+  case DLN2_SPI_READ:
+  case DLN2_SPI_WRITE: {
+    /* Request: port, size (le16), attr, then data for READ_WRITE/WRITE. */
+    uint16_t size = get_le16(&req[0]);
+    uint8_t attr = req[2];
+    const uint8_t *data = (id == DLN2_SPI_READ) ? NULL : &req[3];
+    if (size > DLN2_SPI_MAX_XFER_SIZE || (data && len < 12U + size)) {
+      dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+      return;
+    }
+    if (id == DLN2_SPI_WRITE) {
+      spi_xfer(data, NULL, size, attr);
+      dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+      return;
+    }
+    /* Reply: size (le16), then the bytes read. */
+    spi_xfer(data, &USBD_DLN2_TxBuffer[12], size, attr);
+    put_le16(&USBD_DLN2_TxBuffer[10], size);
+    dln2_reply(pdev, 12U + size, DLN2_RESULT_OK);
+    return;
+  }
+
+  default:
+    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+    return;
+  }
+}
+
 static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
   UNUSED(cfgidx);
 
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  spi_init();
 
   USBD_LL_OpenEP(pdev, DLN2_IN_EP, USBD_EP_TYPE_BULK, DLN2_MAX_PACKET_SIZE);
   pdev->ep_in[DLN2_IN_EP & 0x0FU].is_used = 1U;
@@ -282,6 +479,7 @@ static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   USBD_LL_OpenEP(pdev, DLN2_OUT_EP, USBD_EP_TYPE_BULK, DLN2_MAX_PACKET_SIZE);
   pdev->ep_out[DLN2_OUT_EP & 0x0FU].is_used = 1U;
 
+  USBD_DLN2_RxLen = 0U;
   USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
 
   return (uint8_t)USBD_OK;
@@ -333,33 +531,56 @@ static uint8_t USBD_DLN2_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *r
   return (uint8_t)USBD_OK;
 }
 
+/* Reply finished. Replies that end on a packet boundary need a ZLP so the
+ * host sees the end of the transfer. Only then accept the next request, so
+ * a new reply never starts while the previous one is still going out. */
 static uint8_t USBD_DLN2_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
-  UNUSED(pdev);
   UNUSED(epnum);
+
+  if (USBD_DLN2_TxLen != 0U && (USBD_DLN2_TxLen % DLN2_MAX_PACKET_SIZE) == 0U) {
+    USBD_DLN2_TxLen = 0U;
+    USBD_LL_Transmit(pdev, DLN2_IN_EP, NULL, 0U);
+    return (uint8_t)USBD_OK;
+  }
+
+  USBD_DLN2_TxLen = 0U;
+  USBD_DLN2_RxLen = 0U;
+  USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
   return (uint8_t)USBD_OK;
 }
 
 static uint8_t USBD_DLN2_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
-  uint32_t len = USBD_LL_GetRxDataSize(pdev, epnum);
+  USBD_DLN2_RxLen += (uint16_t)USBD_LL_GetRxDataSize(pdev, epnum);
 
-  if (len >= 8U) {
-    uint16_t id     = (uint16_t)USBD_DLN2_RxBuffer[2] |
-                      ((uint16_t)USBD_DLN2_RxBuffer[3] << 8);
-    uint16_t handle = (uint16_t)USBD_DLN2_RxBuffer[6] |
-                      ((uint16_t)USBD_DLN2_RxBuffer[7] << 8);
+  uint16_t size = (USBD_DLN2_RxLen >= 8U) ? get_le16(USBD_DLN2_RxBuffer) : 0U;
 
-    if (handle == DLN2_HANDLE_CTRL) {
-      handle_ctrl(pdev, id);
-    } else if (handle == DLN2_HANDLE_GPIO) {
-      handle_gpio(pdev, id, len);
-    } else {
-      dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
-    }
+  if (size > DLN2_MSG_MAX) {
+    /* Can't hold it; answer now so the host doesn't hang. */
+    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+    return (uint8_t)USBD_OK;
   }
 
-  USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
+  if (USBD_DLN2_RxLen < 8U || USBD_DLN2_RxLen < size) {
+    /* Message incomplete: keep appending. */
+    USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, &USBD_DLN2_RxBuffer[USBD_DLN2_RxLen],
+                           DLN2_MAX_PACKET_SIZE);
+    return (uint8_t)USBD_OK;
+  }
+
+  uint16_t id     = get_le16(&USBD_DLN2_RxBuffer[2]);
+  uint16_t handle = get_le16(&USBD_DLN2_RxBuffer[6]);
+
+  if (handle == DLN2_HANDLE_CTRL) {
+    handle_ctrl(pdev, id);
+  } else if (handle == DLN2_HANDLE_GPIO) {
+    handle_gpio(pdev, id, size);
+  } else if (handle == DLN2_HANDLE_SPI) {
+    handle_spi(pdev, id, size);
+  } else {
+    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+  }
   return (uint8_t)USBD_OK;
 }
 

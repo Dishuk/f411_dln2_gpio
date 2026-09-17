@@ -57,16 +57,44 @@ gpioset gpiochipN 0=1      # LED off
 gpioget gpiochipN 1        # read PB0
 ```
 
+## SPI
+
+SPI1 is exposed as a DLN-2 SPI master with one chip select. The kernel's
+`dln2-spi` driver registers it as `spiN`.
+
+| Signal | Pin (board label) |
+|--------|-------------------|
+| CS0    | PA4 (`A4`)        |
+| SCK    | PA5 (`A5`)        |
+| MISO   | PA6 (`A6`)        |
+| MOSI   | PA7 (`A7`)        |
+
+8-bit frames, modes 0–3, 375 kHz – 48 MHz (96 MHz / 2..256, rounded down).
+
+A USB adapter can't describe what's wired to it, so Linux needs a small
+module to create the SPI device. `host/dln2_adxl345/` registers an ADXL345
+on CS0 (mode 3, 1 MHz) and binds it to spidev:
+
+```
+apt install proxmox-headers-$(uname -r) gcc make   # or linux-headers-* elsewhere
+make -C host/dln2_adxl345
+modprobe spidev
+insmod host/dln2_adxl345/dln2_adxl345.ko           # -> /dev/spidevN.0
+python3 host/adxl345_read.py /dev/spidevN.0        # DEVID = 0xE5, x/y/z in g
+```
+
 ## Layout
 
 ```
 Core/                        CubeMX-generated, has USER CODE blocks
 USB_DEVICE/App/
   usb_device.c               CubeMX; our PostTreatment hook registers DLN-2
-  usbd_dln2.c/.h             DLN-2 class + GPIO command handlers
+  usbd_dln2.c/.h             DLN-2 class + GPIO and SPI command handlers
   usbd_dln2_desc.c/.h        VID/PID/strings for a257:2013
 f411_dln2_gpio.ioc           CubeMX config — source of truth
 Drivers/, Middlewares/       .gitignored; regenerated from .ioc
+host/dln2_adxl345/           Linux module: ADXL345 spidev on the DLN-2 SPI bus
+host/adxl345_read.py         Reads the ADXL345 through spidev
 ```
 
 ## Capabilities
@@ -74,5 +102,6 @@ Drivers/, Middlewares/       .gitignored; regenerated from .ioc
 - 17 GPIO lines (PC13 + PB0–PB15).
 - Per-line direction (input with pull-up, or output push-pull).
 - Per-line value read and write.
+- SPI master on SPI1 with one chip select (see [SPI](#spi)).
 - Pin state is latched across `gpioset` invocations — releasing the line
   on the host does not reset the pin.
