@@ -1,8 +1,8 @@
 /**
  * @file    usbd_dln2.c
  * @brief   Vendor-specific bulk USB class emulating the Diolan DLN-2:
- *          CTRL handshake, GPIO commands on handle=0x0002 and SPI master
- *          commands on handle=0x0004.
+ *          CTRL handshake, GPIO commands and events on handle=0x0002/0x0000
+ *          and SPI master commands on handle=0x0004.
  *          Unknown commands reply result=0x81 to fail fast on the host.
  */
 
@@ -108,6 +108,18 @@ static uint16_t USBD_DLN2_TxLen;
 static USBD_HandleTypeDef *USBD_DLN2_Dev;
 static volatile uint8_t USBD_DLN2_RxReady;
 
+/* What the IN endpoint is sending. Replies and GPIO events share it, and
+ * only the end of a reply may re-arm OUT for the next request. */
+#define TX_IDLE                 0U
+#define TX_REPLY                1U
+#define TX_EVENT                2U
+static volatile uint8_t USBD_DLN2_TxKind;
+
+/* Set by Init (USB IRQ), handled by the main loop, which owns the event
+ * state below. */
+static volatile uint8_t USBD_DLN2_Reconfigured;
+
+#define DLN2_HANDLE_EVENT       0x0000U
 #define DLN2_HANDLE_CTRL        0x0001U
 #define DLN2_HANDLE_GPIO        0x0002U
 #define DLN2_HANDLE_SPI         0x0004U
@@ -126,7 +138,15 @@ static volatile uint8_t USBD_DLN2_RxReady;
 #define DLN2_GPIO_PIN_DISABLE     0x0111U
 #define DLN2_GPIO_PIN_SET_DIR     0x0113U
 #define DLN2_GPIO_PIN_GET_DIR     0x0114U
+#define DLN2_GPIO_CONDITION_MET_EV 0x010FU
 #define DLN2_GPIO_PIN_SET_EVENT   0x011EU
+
+/* Event types; the host maps rising/falling edges to CHANGE and filters
+ * them itself using the reported value. */
+#define DLN2_GPIO_EVENT_NONE      0U
+#define DLN2_GPIO_EVENT_CHANGE    1U
+#define DLN2_GPIO_EVENT_LVL_HIGH  2U
+#define DLN2_GPIO_EVENT_LVL_LOW   3U
 
 /* SPI commands, module = 0x02. Only the ones drivers/spi/spi-dln2.c sends. */
 #define DLN2_SPI_ENABLE                    0x0211U
@@ -194,6 +214,17 @@ static void put_le32(uint8_t *p, uint32_t v)
   p[3] = (uint8_t)(v >> 24);
 }
 
+static void dln2_transmit(USBD_HandleTypeDef *pdev, uint8_t kind, uint8_t *buf, uint16_t len)
+{
+  /* Called from the main loop: keep the USB IRQ out while the transfer is
+   * being set up, the HAL does not guard against that. */
+  HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
+  USBD_DLN2_TxKind = kind;
+  USBD_DLN2_TxLen = len;
+  USBD_LL_Transmit(pdev, DLN2_IN_EP, buf, len);
+  HAL_NVIC_EnableIRQ(OTG_FS_IRQn);
+}
+
 /* Payload (if any) must already be at TxBuffer[10]. */
 static void dln2_reply(USBD_HandleTypeDef *pdev, uint16_t total_size, uint16_t result)
 {
@@ -201,12 +232,7 @@ static void dln2_reply(USBD_HandleTypeDef *pdev, uint16_t total_size, uint16_t r
   /* Copy id, echo, handle from the request. */
   memcpy(&USBD_DLN2_TxBuffer[2], &USBD_DLN2_RxBuffer[2], 6);
   put_le16(&USBD_DLN2_TxBuffer[8], result);
-  USBD_DLN2_TxLen = total_size;
-  /* Called from the main loop: keep the USB IRQ out while the transfer is
-   * being set up, the HAL does not guard against that. */
-  HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
-  USBD_LL_Transmit(pdev, DLN2_IN_EP, USBD_DLN2_TxBuffer, total_size);
-  HAL_NVIC_EnableIRQ(OTG_FS_IRQn);
+  dln2_transmit(pdev, TX_REPLY, USBD_DLN2_TxBuffer, total_size);
 }
 
 static void gpio_init_pin(uint16_t pin_idx, uint32_t mode, uint32_t pull)
@@ -238,6 +264,92 @@ static uint8_t gpio_is_output(uint16_t pin_idx)
   return (mode == 0x1U) ? 1U : 0U;
 }
 
+/* Level of every line as a bitmask, bit n = pin n (PC13, then PB0..PB15). */
+static uint32_t gpio_levels(void)
+{
+  return ((GPIOC->IDR >> 13) & 1U) | ((GPIOB->IDR & 0xFFFFU) << 1);
+}
+
+/* GPIO events. Lines are sampled on every main loop pass rather than with
+ * EXTI, because PC13 and PB13 would both need EXTI line 13. A pulse shorter
+ * than one pass (up to a few ms during slow SPI transfers) can be missed.
+ * All of this is only touched from the main loop. */
+#define EVT_QUEUE_LEN 32U
+
+static uint8_t  evt_type[DLN2_N_PINS];
+static uint32_t evt_enabled;     /* bitmask of pins with an event type set */
+static uint32_t evt_last;        /* levels at the previous pass */
+static uint16_t evt_count;       /* running counter reported to the host */
+static struct { uint8_t pin, value; } evt_queue[EVT_QUEUE_LEN];
+static uint8_t  evt_head, evt_tail;
+static uint8_t  USBD_DLN2_EvtBuffer[14];
+
+/* Full queue drops the event: the host reads the line's value itself when
+ * it handles an edge, so a lost one only merges two edges. */
+static void evt_push(uint16_t pin, uint32_t levels)
+{
+  uint8_t next = (uint8_t)((evt_head + 1U) % EVT_QUEUE_LEN);
+  if (next != evt_tail) {
+    evt_queue[evt_head].pin = (uint8_t)pin;
+    evt_queue[evt_head].value = (uint8_t)((levels >> pin) & 1U);
+    evt_head = next;
+  }
+}
+
+static uint8_t evt_condition_met(uint16_t pin, uint32_t levels)
+{
+  uint32_t level = (levels >> pin) & 1U;
+  return (evt_type[pin] == DLN2_GPIO_EVENT_CHANGE) ||
+         (evt_type[pin] == DLN2_GPIO_EVENT_LVL_HIGH && level) ||
+         (evt_type[pin] == DLN2_GPIO_EVENT_LVL_LOW && !level);
+}
+
+static void evt_set(uint16_t pin, uint8_t type)
+{
+  uint32_t levels = gpio_levels();
+  evt_type[pin] = type;
+  if (type == DLN2_GPIO_EVENT_NONE) {
+    evt_enabled &= ~(1UL << pin);
+    return;
+  }
+  evt_enabled |= 1UL << pin;
+  evt_last = (evt_last & ~(1UL << pin)) | (levels & (1UL << pin));
+  /* A level condition that already holds fires right away. */
+  if (type != DLN2_GPIO_EVENT_CHANGE && evt_condition_met(pin, levels)) {
+    evt_push(pin, levels);
+  }
+}
+
+static void evt_scan(void)
+{
+  uint32_t levels = gpio_levels();
+  uint32_t changed = (levels ^ evt_last) & evt_enabled;
+  evt_last = levels;
+  while (changed != 0U) {
+    uint16_t pin = (uint16_t)__builtin_ctz(changed);
+    changed &= changed - 1U;
+    if (evt_condition_met(pin, levels)) {
+      evt_push(pin, levels);
+    }
+  }
+}
+
+static void evt_send(USBD_HandleTypeDef *pdev)
+{
+  uint8_t *b = USBD_DLN2_EvtBuffer;
+  /* Header without a result field, then count, type, pin, value. */
+  put_le16(&b[0], sizeof(USBD_DLN2_EvtBuffer));
+  put_le16(&b[2], DLN2_GPIO_CONDITION_MET_EV);
+  put_le16(&b[4], 0U);
+  put_le16(&b[6], DLN2_HANDLE_EVENT);
+  put_le16(&b[8], ++evt_count);
+  b[10] = evt_type[evt_queue[evt_tail].pin];
+  put_le16(&b[11], evt_queue[evt_tail].pin);
+  b[13] = evt_queue[evt_tail].value;
+  evt_tail = (uint8_t)((evt_tail + 1U) % EVT_QUEUE_LEN);
+  dln2_transmit(pdev, TX_EVENT, b, sizeof(USBD_DLN2_EvtBuffer));
+}
+
 static void handle_ctrl(USBD_HandleTypeDef *pdev, uint16_t id)
 {
   uint32_t payload;
@@ -267,10 +379,22 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
     dln2_reply(pdev, 12U, DLN2_RESULT_OK);
     return;
 
-  case DLN2_GPIO_SET_DEBOUNCE:    /* no-op; HW debounce not implemented */
-  case DLN2_GPIO_PIN_SET_EVENT:   /* no-op; IRQ events not implemented */
+  case DLN2_GPIO_SET_DEBOUNCE:    /* no-op; debounce not implemented */
     dln2_reply(pdev, 10U, DLN2_RESULT_OK);
     return;
+
+  case DLN2_GPIO_PIN_SET_EVENT: {
+    /* Request: pin (le16), type, period (le16). A non-zero period asks for
+     * repeated level events; the kernel always sends 0, so it's ignored. */
+    uint8_t type = (len >= 11U) ? USBD_DLN2_RxBuffer[10] : 0xFFU;
+    if (pin >= DLN2_N_PINS || type > DLN2_GPIO_EVENT_LVL_LOW) {
+      dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+      return;
+    }
+    evt_set(pin, type);
+    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
+    return;
+  }
 
   case DLN2_GPIO_PIN_ENABLE:
   case DLN2_GPIO_PIN_DISABLE:
@@ -508,6 +632,8 @@ static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   USBD_DLN2_RxReady = 0U;
   USBD_DLN2_RxLen = 0U;
   USBD_DLN2_TxLen = 0U;
+  USBD_DLN2_TxKind = TX_IDLE;
+  USBD_DLN2_Reconfigured = 1U;
   USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
 
   return (uint8_t)USBD_OK;
@@ -522,6 +648,8 @@ static uint8_t USBD_DLN2_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 
   USBD_LL_CloseEP(pdev, DLN2_OUT_EP);
   pdev->ep_out[DLN2_OUT_EP & 0x0FU].is_used = 0U;
+
+  USBD_DLN2_Reconfigured = 1U;   /* stop and drop GPIO events */
 
   return (uint8_t)USBD_OK;
 }
@@ -559,9 +687,10 @@ static uint8_t USBD_DLN2_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *r
   return (uint8_t)USBD_OK;
 }
 
-/* Reply finished. Replies that end on a packet boundary need a ZLP so the
- * host sees the end of the transfer. Only then accept the next request, so
- * a new reply never starts while the previous one is still going out. */
+/* Reply or event finished. Messages that end on a packet boundary need a
+ * ZLP so the host sees the end of the transfer. Only after a reply accept
+ * the next request, so a new reply never starts while the previous one is
+ * still going out. */
 static uint8_t USBD_DLN2_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
   UNUSED(epnum);
@@ -572,9 +701,12 @@ static uint8_t USBD_DLN2_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
     return (uint8_t)USBD_OK;
   }
 
+  if (USBD_DLN2_TxKind == TX_REPLY) {
+    USBD_DLN2_RxLen = 0U;
+    USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
+  }
   USBD_DLN2_TxLen = 0U;
-  USBD_DLN2_RxLen = 0U;
-  USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
+  USBD_DLN2_TxKind = TX_IDLE;
   return (uint8_t)USBD_OK;
 }
 
@@ -597,7 +729,23 @@ static uint8_t USBD_DLN2_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 
 void USBD_DLN2_Poll(void)
 {
+  if (USBD_DLN2_Reconfigured) {
+    /* New host session: it re-enables the events it wants. */
+    USBD_DLN2_Reconfigured = 0U;
+    evt_enabled = 0U;
+    evt_head = evt_tail = 0U;
+  }
+
+  evt_scan();
+
+  if (USBD_DLN2_TxKind != TX_IDLE) {
+    return;
+  }
+  /* Requests first: the host often answers an event with a request. */
   if (!USBD_DLN2_RxReady) {
+    if (evt_head != evt_tail && USBD_DLN2_Dev->dev_state == USBD_STATE_CONFIGURED) {
+      evt_send(USBD_DLN2_Dev);
+    }
     return;
   }
   USBD_DLN2_RxReady = 0U;

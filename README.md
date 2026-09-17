@@ -102,6 +102,11 @@ host/adxl345_read.py         Reads the ADXL345 through spidev
 - 17 GPIO lines (PC13 + PB0–PB15).
 - Per-line direction (input with pull-up, or output push-pull).
 - Per-line value read and write.
+- Edge and level events on every line, so `gpiomon` works. Lines are
+  sampled in the main loop (no EXTI: PC13 and PB13 share EXTI line 13), so
+  pulses shorter than one loop pass can be missed. With `-r` or `-f` the
+  edge type is exact; when watching both edges, the kernel reads the line
+  again to label each event, so very fast changes may be mislabelled.
 - SPI master on SPI1 with one chip select (see [SPI](#spi)).
 - Pin state is latched across `gpioset` invocations — releasing the line
   on the host does not reset the pin.
