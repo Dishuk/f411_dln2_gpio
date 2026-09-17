@@ -68,7 +68,7 @@ make -C host/dln2_adxl345                           # needs kernel headers, gcc,
 modprobe spidev
 insmod host/dln2_adxl345/dln2_adxl345.ko            # params: cs=0..3, speed_hz
 python3 host/adxl345_read.py /dev/spidevN.0         # DEVID 0xE5, x/y/z in g
-python3 host/adxl345_live.py /dev/spidevN.0         # live plot at http://<host>:8000/
+python3 host/dln2_live.py --spi /dev/spidevN.0      # live plot at http://<host>:8000/
 ```
 
 Throughput is bounded by USB full speed: about 200 KB/s at 6 MHz, with a
@@ -96,6 +96,17 @@ echo 1   > $D/buffer/enable                      # samples on /dev/iio:deviceN
 - Supply voltage: `VDDA = 3.3 * (VREFINT_CAL / 4) / in_voltage4_raw`.
 - Temperature: `code = in_voltage5_raw * 4 * VDDA / 3.3`, then
   `T = 30 + (code - TS_CAL1) * 80 / (TS_CAL2 - TS_CAL1)`.
+
+`host/dln2_live.py` shows all channels, VDDA and temperature in the browser
+(10 Hz). The ADC panel appears when a `dln2-adc` device exists; `--spi`
+adds the ADXL345 panel.
+
+```bash
+python3 host/dln2_live.py --cal 1506,945,1196    # VREFINT_CAL,TS_CAL1,TS_CAL2 of your chip
+```
+
+Without `--cal`, VDDA and temperature use datasheet typical values
+(VREFINT 1.21 V, V25 0.76 V, 2.5 mV/°C).
 
 ## How it works
 
@@ -152,7 +163,7 @@ f411_dln2_gpio/
 ├── host/
 │   ├── dln2_adxl345/            # Linux module: ADXL345 spidev on the DLN-2 SPI bus
 │   ├── adxl345_read.py          # Read the ADXL345 through spidev
-│   └── adxl345_live.py          # Live accelerometer plot in the browser
+│   └── dln2_live.py             # Browser view: ADXL345 and ADC readings
 └── f411_dln2_gpio.ioc           # CubeMX config — source of truth
 ```
 
