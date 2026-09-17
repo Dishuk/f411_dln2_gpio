@@ -103,6 +103,11 @@ static uint16_t USBD_DLN2_RxLen;
 static uint8_t  USBD_DLN2_TxBuffer[DLN2_MSG_MAX];
 static uint16_t USBD_DLN2_TxLen;
 
+/* A complete request waits here for USBD_DLN2_Poll(). The OUT endpoint is
+ * not re-armed until its reply has been sent, so there is only ever one. */
+static USBD_HandleTypeDef *USBD_DLN2_Dev;
+static volatile uint8_t USBD_DLN2_RxReady;
+
 #define DLN2_HANDLE_CTRL        0x0001U
 #define DLN2_HANDLE_GPIO        0x0002U
 #define DLN2_HANDLE_SPI         0x0004U
@@ -197,7 +202,11 @@ static void dln2_reply(USBD_HandleTypeDef *pdev, uint16_t total_size, uint16_t r
   memcpy(&USBD_DLN2_TxBuffer[2], &USBD_DLN2_RxBuffer[2], 6);
   put_le16(&USBD_DLN2_TxBuffer[8], result);
   USBD_DLN2_TxLen = total_size;
+  /* Called from the main loop: keep the USB IRQ out while the transfer is
+   * being set up, the HAL does not guard against that. */
+  HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
   USBD_LL_Transmit(pdev, DLN2_IN_EP, USBD_DLN2_TxBuffer, total_size);
+  HAL_NVIC_EnableIRQ(OTG_FS_IRQn);
 }
 
 static void gpio_init_pin(uint16_t pin_idx, uint32_t mode, uint32_t pull)
@@ -209,6 +218,16 @@ static void gpio_init_pin(uint16_t pin_idx, uint32_t mode, uint32_t pull)
     .Speed = GPIO_SPEED_FREQ_LOW,
   };
   HAL_GPIO_Init(dln2_pin_map[pin_idx].port, &init);
+}
+
+/* All lines start as inputs with pull-up. */
+static void gpio_init_all(void)
+{
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  for (uint16_t i = 0U; i < DLN2_N_PINS; i++) {
+    gpio_init_pin(i, GPIO_MODE_INPUT, GPIO_PULLUP);
+  }
 }
 
 static uint8_t gpio_is_output(uint16_t pin_idx)
@@ -254,14 +273,10 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
     return;
 
   case DLN2_GPIO_PIN_ENABLE:
-    if (pin >= DLN2_N_PINS) { dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED); return; }
-    gpio_init_pin(pin, GPIO_MODE_INPUT, GPIO_PULLUP);
-    dln2_reply(pdev, 10U, DLN2_RESULT_OK);
-    return;
-
   case DLN2_GPIO_PIN_DISABLE:
-    /* No-op so that pin state persists after `gpioset` exits and the
-     * kernel releases the line; otherwise the LED would blink once. */
+    /* No-ops: the pin keeps its direction and level while no one holds the
+     * line, and the host reads the direction back after enabling it.
+     * Resetting it here made every new `gpioset` glitch the output. */
     if (pin >= DLN2_N_PINS) { dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED); return; }
     dln2_reply(pdev, 10U, DLN2_RESULT_OK);
     return;
@@ -443,7 +458,9 @@ static void handle_spi(USBD_HandleTypeDef *pdev, uint16_t id, uint16_t len)
     uint16_t size = get_le16(&req[0]);
     uint8_t attr = req[2];
     const uint8_t *data = (id == DLN2_SPI_READ) ? NULL : &req[3];
-    if (size > DLN2_SPI_MAX_XFER_SIZE || (data && len < 12U + size)) {
+    /* With SPE clear the busy-waits in spi_xfer() would never finish. */
+    if ((SPI1->CR1 & SPI_CR1_SPE) == 0U ||
+        size > DLN2_SPI_MAX_XFER_SIZE || (data && len < 12U + size)) {
       dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
       return;
     }
@@ -469,9 +486,16 @@ static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
 {
   UNUSED(cfgidx);
 
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  spi_init();
+  /* Only once: Init also runs from the USB IRQ when the host reconnects,
+   * possibly in the middle of a request in the main loop. Re-initialising
+   * then would clear SPE under a running spi_xfer() and hang it, and would
+   * reset GPIO outputs. The host re-applies its SPI settings anyway. */
+  static uint8_t hw_ready;
+  if (!hw_ready) {
+    gpio_init_all();
+    spi_init();
+    hw_ready = 1U;
+  }
 
   USBD_LL_OpenEP(pdev, DLN2_IN_EP, USBD_EP_TYPE_BULK, DLN2_MAX_PACKET_SIZE);
   pdev->ep_in[DLN2_IN_EP & 0x0FU].is_used = 1U;
@@ -479,7 +503,11 @@ static uint8_t USBD_DLN2_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
   USBD_LL_OpenEP(pdev, DLN2_OUT_EP, USBD_EP_TYPE_BULK, DLN2_MAX_PACKET_SIZE);
   pdev->ep_out[DLN2_OUT_EP & 0x0FU].is_used = 1U;
 
+  /* Also runs after a bus reset: drop anything half-received or half-sent. */
+  USBD_DLN2_Dev = pdev;
+  USBD_DLN2_RxReady = 0U;
   USBD_DLN2_RxLen = 0U;
+  USBD_DLN2_TxLen = 0U;
   USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, USBD_DLN2_RxBuffer, DLN2_MAX_PACKET_SIZE);
 
   return (uint8_t)USBD_OK;
@@ -556,23 +584,33 @@ static uint8_t USBD_DLN2_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
 
   uint16_t size = (USBD_DLN2_RxLen >= 8U) ? get_le16(USBD_DLN2_RxBuffer) : 0U;
 
-  if (size > DLN2_MSG_MAX) {
-    /* Can't hold it; answer now so the host doesn't hang. */
-    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
-    return (uint8_t)USBD_OK;
-  }
-
-  if (USBD_DLN2_RxLen < 8U || USBD_DLN2_RxLen < size) {
+  if (USBD_DLN2_RxLen < 8U || (USBD_DLN2_RxLen < size && size <= DLN2_MSG_MAX)) {
     /* Message incomplete: keep appending. */
     USBD_LL_PrepareReceive(pdev, DLN2_OUT_EP, &USBD_DLN2_RxBuffer[USBD_DLN2_RxLen],
                            DLN2_MAX_PACKET_SIZE);
     return (uint8_t)USBD_OK;
   }
 
+  USBD_DLN2_RxReady = 1U;
+  return (uint8_t)USBD_OK;
+}
+
+void USBD_DLN2_Poll(void)
+{
+  if (!USBD_DLN2_RxReady) {
+    return;
+  }
+  USBD_DLN2_RxReady = 0U;
+
+  USBD_HandleTypeDef *pdev = USBD_DLN2_Dev;
+  uint16_t size   = get_le16(&USBD_DLN2_RxBuffer[0]);
   uint16_t id     = get_le16(&USBD_DLN2_RxBuffer[2]);
   uint16_t handle = get_le16(&USBD_DLN2_RxBuffer[6]);
 
-  if (handle == DLN2_HANDLE_CTRL) {
+  if (size > DLN2_MSG_MAX) {
+    /* Too big to hold; answer anyway so the host doesn't wait. */
+    dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
+  } else if (handle == DLN2_HANDLE_CTRL) {
     handle_ctrl(pdev, id);
   } else if (handle == DLN2_HANDLE_GPIO) {
     handle_gpio(pdev, id, size);
@@ -581,7 +619,6 @@ static uint8_t USBD_DLN2_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
   } else {
     dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED);
   }
-  return (uint8_t)USBD_OK;
 }
 
 static uint8_t *USBD_DLN2_GetFSCfgDesc(uint16_t *length)

@@ -18,6 +18,9 @@ extern "C" {
 
 extern USBD_ClassTypeDef USBD_DLN2;
 
+/* Handles a received request, if any. Call from the main loop. */
+void USBD_DLN2_Poll(void);
+
 #ifdef __cplusplus
 }
 #endif

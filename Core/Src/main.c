@@ -23,7 +23,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usbd_dln2.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -89,7 +89,14 @@ int main(void)
   MX_GPIO_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-
+  /* Independent watchdog, ~0.5 s (LSI 32 kHz / 64 * 250), refreshed by the
+   * main loop, so a hang ends in a reset and re-enumeration instead of a
+   * dead adapter. Frozen while a debugger halts the core. */
+  DBGMCU->APB1FZ |= DBGMCU_APB1_FZ_DBG_IWDG_STOP;
+  IWDG->KR = 0x5555U;   /* unlock PR/RLR */
+  IWDG->PR = 4U;        /* /64 */
+  IWDG->RLR = 250U;
+  IWDG->KR = 0xCCCCU;   /* start */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -99,6 +106,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    USBD_DLN2_Poll();
+    IWDG->KR = 0xAAAAU;   /* refresh watchdog */
   }
   /* USER CODE END 3 */
 }
