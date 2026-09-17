@@ -59,21 +59,26 @@ gpioget gpiochipN 1        # read PB0
 
 ## SPI
 
-SPI1 is exposed as a DLN-2 SPI master with one chip select. The kernel's
+SPI1 is exposed as a DLN-2 SPI master with four chip selects. The kernel's
 `dln2-spi` driver registers it as `spiN`.
 
 | Signal | Pin (board label) |
 |--------|-------------------|
 | CS0    | PA4 (`A4`)        |
+| CS1    | PA8 (`A8`)        |
+| CS2    | PA9 (`A9`)        |
+| CS3    | PA10 (`A10`)      |
 | SCK    | PA5 (`A5`)        |
 | MISO   | PA6 (`A6`)        |
 | MOSI   | PA7 (`A7`)        |
 
-8-bit frames, modes 0–3, 375 kHz – 48 MHz (96 MHz / 2..256, rounded down).
+8- or 16-bit frames, modes 0–3, 375 kHz – 48 MHz (96 MHz / 2..256, rounded
+down).
 
 A USB adapter can't describe what's wired to it, so Linux needs a small
 module to create the SPI device. `host/dln2_adxl345/` registers an ADXL345
-on CS0 (mode 3, 1 MHz) and binds it to spidev:
+on CS0 (mode 3, 1 MHz; module params `cs`, `speed_hz`) and binds it to
+spidev:
 
 ```
 apt install proxmox-headers-$(uname -r) gcc make   # or linux-headers-* elsewhere
@@ -107,6 +112,8 @@ host/adxl345_read.py         Reads the ADXL345 through spidev
   pulses shorter than one loop pass can be missed. With `-r` or `-f` the
   edge type is exact; when watching both edges, the kernel reads the line
   again to label each event, so very fast changes may be mislabelled.
-- SPI master on SPI1 with one chip select (see [SPI](#spi)).
+- Event debounce (libgpiod v2 `--debounce`, one period shared by all lines;
+  cleared when no line has events enabled).
+- SPI master on SPI1 with four chip selects (see [SPI](#spi)).
 - Pin state is latched across `gpioset` invocations — releasing the line
   on the host does not reset the pin.

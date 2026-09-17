@@ -255,6 +255,10 @@ static void gpio_init_all(void)
   for (uint16_t i = 0U; i < DLN2_N_PINS; i++) {
     gpio_init_pin(i, GPIO_MODE_INPUT, GPIO_PULLUP);
   }
+  /* Cycle counter for event debounce timing. */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
 static uint8_t gpio_is_output(uint16_t pin_idx)
@@ -279,7 +283,10 @@ static uint32_t gpio_levels(void)
 
 static uint8_t  evt_type[DLN2_N_PINS];
 static uint32_t evt_enabled;     /* bitmask of pins with an event type set */
-static uint32_t evt_last;        /* levels at the previous pass */
+static uint32_t evt_raw;         /* levels at the previous pass */
+static uint32_t evt_stable;      /* debounced levels, what events report */
+static uint32_t evt_since[DLN2_N_PINS];   /* DWT CYCCNT of last raw change */
+static uint32_t evt_debounce;    /* in CPU cycles; 0 = off */
 static uint16_t evt_count;       /* running counter reported to the host */
 static struct { uint8_t pin, value; } evt_queue[EVT_QUEUE_LEN];
 static uint8_t  evt_head, evt_tail;
@@ -311,26 +318,58 @@ static void evt_set(uint16_t pin, uint8_t type)
   evt_type[pin] = type;
   if (type == DLN2_GPIO_EVENT_NONE) {
     evt_enabled &= ~(1UL << pin);
+    /* The kernel never sends debounce 0 when a debounced line is released,
+     * and sends SET_DEBOUNCE before enabling events, so forget it here. */
+    if (evt_enabled == 0U) {
+      evt_debounce = 0U;
+    }
     return;
   }
-  evt_enabled |= 1UL << pin;
-  evt_last = (evt_last & ~(1UL << pin)) | (levels & (1UL << pin));
+  uint32_t bit = 1UL << pin;
+  evt_enabled |= bit;
+  evt_raw = (evt_raw & ~bit) | (levels & bit);
+  evt_stable = (evt_stable & ~bit) | (levels & bit);
   /* A level condition that already holds fires right away. */
   if (type != DLN2_GPIO_EVENT_CHANGE && evt_condition_met(pin, levels)) {
     evt_push(pin, levels);
   }
 }
 
+/* SET_DEBOUNCE carries microseconds (the kernel passes the pinconf value
+ * as-is) and applies to all lines. Capped so the cycle count fits in 32 bits
+ * with CYCCNT wrapping every ~44 s at 96 MHz. */
+static void evt_set_debounce(uint32_t us)
+{
+  if (us > 40000000UL) {
+    us = 40000000UL;
+  }
+  evt_debounce = us * (SystemCoreClock / 1000000U);
+}
+
+/* A new level counts once it has held for the debounce time (immediately
+ * when debounce is off). */
 static void evt_scan(void)
 {
   uint32_t levels = gpio_levels();
-  uint32_t changed = (levels ^ evt_last) & evt_enabled;
-  evt_last = levels;
-  while (changed != 0U) {
-    uint16_t pin = (uint16_t)__builtin_ctz(changed);
-    changed &= changed - 1U;
-    if (evt_condition_met(pin, levels)) {
-      evt_push(pin, levels);
+  uint32_t now = DWT->CYCCNT;
+
+  uint32_t moved = (levels ^ evt_raw) & evt_enabled;
+  evt_raw = levels;
+  while (moved != 0U) {
+    uint16_t pin = (uint16_t)__builtin_ctz(moved);
+    moved &= moved - 1U;
+    evt_since[pin] = now;
+  }
+
+  uint32_t pending = (levels ^ evt_stable) & evt_enabled;
+  while (pending != 0U) {
+    uint16_t pin = (uint16_t)__builtin_ctz(pending);
+    pending &= pending - 1U;
+    if (now - evt_since[pin] >= evt_debounce) {
+      evt_stable ^= 1UL << pin;
+      if (evt_condition_met(pin, evt_stable)) {
+        evt_push(pin, evt_stable);
+      }
     }
   }
 }
@@ -380,7 +419,12 @@ static void handle_gpio(USBD_HandleTypeDef *pdev, uint16_t id, uint32_t len)
     dln2_reply(pdev, 12U, DLN2_RESULT_OK);
     return;
 
-  case DLN2_GPIO_SET_DEBOUNCE:    /* no-op; debounce not implemented */
+  case DLN2_GPIO_SET_DEBOUNCE:    /* request: duration (le32, µs), no pin */
+    if (len < 12U) { dln2_reply(pdev, 10U, DLN2_RESULT_UNSUPPORTED); return; }
+    evt_set_debounce((uint32_t)USBD_DLN2_RxBuffer[8] |
+                     ((uint32_t)USBD_DLN2_RxBuffer[9] << 8) |
+                     ((uint32_t)USBD_DLN2_RxBuffer[10] << 16) |
+                     ((uint32_t)USBD_DLN2_RxBuffer[11] << 24));
     dln2_reply(pdev, 10U, DLN2_RESULT_OK);
     return;
 
@@ -780,6 +824,7 @@ void USBD_DLN2_Poll(void)
     /* New host session: it re-enables the events it wants. */
     USBD_DLN2_Reconfigured = 0U;
     evt_enabled = 0U;
+    evt_debounce = 0U;
     evt_head = evt_tail = 0U;
   }
 
